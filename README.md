@@ -9,7 +9,7 @@
 🪄 XSSDynaGen is a tool designed to analyze URLs with parameters, identify the characters allowed by the server, and generate advanced XSS payloads based on the analysis results. It utilizes fast and modern technologies like AsyncIO and aiohttp for high-speed scanning and payload generation.
 
 ## 📸 Screenshot:
-![xssdynagen](https://github.com/user-attachments/assets/050e79ac-eb61-498c-b61f-730086ff29d1)
+![xssdynagen](https://github.com/user-attachments/assets/a53b5788-10cf-40c1-a34b-0a85e21112c3)
 
 ## 🌟 Features
 
@@ -41,7 +41,7 @@
    pipx install "uvloop>=0.17.0"
    ```
 
-**For older Kali Linux versions ensure that you have Python 3.8+ installed. Install the required dependencies using pip:**
+**If you're using an older Kali Linux version or a different Linux distribution ensure that you have Python 3.8+ installed. Then install the required dependencies using pip:**
 
    ```bash
    pip install -r requirements.txt
