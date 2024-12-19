@@ -1,0 +1,88 @@
+# Basic alphanumeric characters
+[basic]
+abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+
+# Special characters commonly used in XSS
+[special]
+<>()[]{}'"`;/\|@$^*+=!?~:,.-_#&%
+
+# Tag and script variations
+[script_chars]
+ScRiPt
+ImG
+SvG
+IfrAmE
+OnLoAd
+
+# Whitespace characters
+[spaces]
+ 	
+\r\n\t\v\f
+
+# HTML encoded versions
+[encoded]
+%20%0A%0D%3C%3E%22%27%3B%28%29%2F%5C
+&#x20;&#x0A;&#x0D;&#x3C;&#x3E;&#x22;&#x27;&#x3B;&#x28;&#x29;
+&lt;&gt;&quot;&apos;&#x2F;&#x5C;
+
+# Unicode characters that can be used for obfuscation
+[unicode]
+＜＞＂＇｛｝［］（）
+′″‴‵‶‷
+"„""''‚'
+‹›«»
+˂˃˄˅
+〈〉《》「」『』【】
+
+# Null bytes and special control characters
+[nullbytes]
+\x00\x07\x08\x0B\x0C\x0E\x0F\x10\x11\x12\x13\x14\x1A\x1B\x1C\x1D\x1E\x1F
+
+# Event handlers commonly used in XSS
+[events]
+onmouseover
+onclick
+onerror
+onload
+onfocus
+onmouseenter
+onmouseleave
+onkeyup
+onkeydown
+onsubmit
+onchange
+ondblclick
+
+# Protocol handlers
+[protocols]
+javascript:
+data:
+vbscript:
+file:
+
+# Comment markers
+[comments]
+<!--
+-->
+/*
+*/
+//
+#
+
+# Special attribute characters
+[attributes]
+=
+:
+-
+_
+.
+/
+
+# Double encoded characters
+[double_encoded]
+%253C
+%253E
+%2522
+%2527
+%255C
+%252F

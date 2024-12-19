@@ -1,0 +1,62 @@
+name: Version Bump
+on:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  bump-version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4  # Updated to v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Configure Git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+      
+      - name: Get current version and create new tag
+        id: tag_version
+        run: |
+          git fetch --tags
+          # Get the latest tag, default to v0.0.0 if none exists
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "Latest tag: $LATEST_TAG"
+          
+          # Extract version numbers
+          VERSION=${LATEST_TAG#v}
+          if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: Invalid version format in latest tag"
+            exit 1
+          fi
+          
+          MAJOR=$(echo $VERSION | cut -d. -f1)
+          MINOR=$(echo $VERSION | cut -d. -f2)
+          PATCH=$(echo $VERSION | cut -d. -f3)
+          
+          # Increment patch version
+          NEW_PATCH=$((PATCH + 1))
+          NEW_TAG="v$MAJOR.$MINOR.$NEW_PATCH"
+          
+          echo "New tag will be: $NEW_TAG"
+          echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+          echo "old_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+      
+      - name: Create and push new tag
+        run: |
+          if ! git rev-parse "${{ steps.tag_version.outputs.new_tag }}" >/dev/null 2>&1; then
+            git tag ${{ steps.tag_version.outputs.new_tag }}
+            git push origin ${{ steps.tag_version.outputs.new_tag }}
+            echo "Successfully created and pushed tag ${{ steps.tag_version.outputs.new_tag }}"
+          else
+            echo "Tag ${{ steps.tag_version.outputs.new_tag }} already exists, skipping"
+            exit 1
+          fi

@@ -1,0 +1,4 @@
+aiohttp==3.8.0
+colorama==0.4.6
+tqdm==4.65.0
+uvloop==0.17.0; platform_system != "Windows"
