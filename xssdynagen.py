@@ -26,7 +26,7 @@ try:
 except ImportError:
     pass
 
-DEFAULT_MAX_CONNECTIONS = 50
+DEFAULT_MAX_CONNECTIONS = 40
 DEFAULT_BATCH_SIZE = 10
 VERSION = "0.0.1"
 GITHUB_REPOSITORY: str = "Cybersecurity-Ethical-Hacker/xssdynagen"
