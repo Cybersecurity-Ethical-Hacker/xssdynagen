@@ -92,10 +92,10 @@ The tool requires URLs with parameters (e.g., `?id=1` or `?search=example&page=2
 If you don't have a URL with parameters or a list of such URLs, you can generate one using the following method (replace the `domain.com`):
 
 ```bash
-paramspider -d domain.com -s 2>&1 | grep -Ei "https?://" | sort -u > urls.txt
+paramspider -d domain.com -s 2>&1 | grep -Ei "https?://" | sort -u | httpx -silent -status-code -mc 200,201,204,401,403 > live_urls.txt
 ```
 
-Alternatively, you can combine tools like `waybackurls`, `httpx`, `katana`, and others to collect URLs efficiently.
+Alternatively, you can use tools like `waybackurls`, `urlfinder`, `katana`, and others to collect URLs efficiently.
 
 Then just load the list using `-l urls.txt`.
 
@@ -192,5 +192,5 @@ Ensure that your use of this tool complies with all applicable local, national, 
 Whether you're a budding penetration tester aiming to enhance your skills or a seasoned professional seeking to uncover and mitigate security issues, LFier is here to support your journey in building a safer digital landscape.
 
 > [!NOTE]
-> Building a Safer Digital World. 🔒
+> Let’s build a safer web together! 🌐🔐
 
