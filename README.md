@@ -85,14 +85,14 @@ Whenever you:
 You must activate the virtual environment before running XSSDynagen to ensure that all dependencies are correctly loaded.
 
 
-## 🧩 **URLs with Parameters**
+## 🧩 **URLs with Parameters - Kali Linux**
 
 The tool requires URLs with parameters (e.g., `?id=1` or `?search=example&page=2`) to work effectively.
 
-If you don't have a URL with parameters or a list of such URLs, you can generate one using the following method (replace the `domain.com`):
+If you don't have a URL with parameters or a list of such URLs, you can generate one using the following method (replace the `domain.com`). Processing may take significant time.:
 
 ```bash
-paramspider -d domain.com -s 2>&1 | grep -Ei "https?://" | sort -u | httpx -silent -status-code -mc 200,201,204,401,403 > live_urls.txt
+paramspider -d domain.com -s 2>&1 | grep -Ei "https?://" | sort -u | httpx-toolkit -silent no-status-code -mc 200,201,204,401,403 > live_urls.txt
 ```
 
 Alternatively, you can use tools like `waybackurls`, `urlfinder`, `katana`, and others to collect URLs efficiently.
