@@ -104,7 +104,7 @@ XSSDynaGen can be used to scan a single domain or a list of URLs.
 
 📍 Command-Line Options:
 ```
-Usage: oredirectme.py [options]
+Usage: xssdynagen.py [options]
 
 options:
   -h, --help         Show this help message and exit
