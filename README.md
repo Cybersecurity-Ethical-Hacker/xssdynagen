@@ -9,7 +9,7 @@
 🪄 XSSDynaGen is a tool designed to analyze URLs with parameters, identify the characters allowed by the server, and generate advanced XSS payloads based on the analysis results. It utilizes fast and modern technologies like AsyncIO and aiohttp for high-speed scanning and payload generation.
 
 ## 📸 Screenshot:
-![xssdynagen](https://github.com/user-attachments/assets/a53b5788-10cf-40c1-a34b-0a85e21112c3)
+![xssdynagen](https://github.com/user-attachments/assets/02f7afc2-c755-493e-85e3-c702b01e35a8)
 
 ## 🌟 Features
 
